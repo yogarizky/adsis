@@ -1,0 +1,221 @@
+Description: AWS CloudFormation sample template for deploying Redmine with plugins
+Parameters:
+  KeyName:
+    Description: EC2 key pair name
+    Type: String
+  InstanceType:
+    Description: EC2 instance type of the server
+    Type: String
+    Default: t2.micro
+  SESUsername:
+    Description: The SES SMTP user name to use for outgoing email
+    Type: String
+  SESPassword:
+    Description: The SES SMTP password to use for outgoing email
+    Type: String
+  EmailDomain:
+    Description: The domain name from which redmine will send email
+    Type: String
+  UseLoadBalancer:
+    Description: Whether to use a load balancer or deploy an internal reverse proxy. This is mostly related to SSL configuration.
+    Type: String
+    Default: yes
+
+Conditions: 
+  EnableELB: !Equals [ !Ref UseLoadBalancer, yes ]
+  DisableELB: !Not [ !Equals [ !Ref UseLoadBalancer, yes ] ]
+
+Mappings:
+  UbuntuAMIs:
+    us-gov-west-1:
+      precise: ami-48008529
+      xenial: ami-67880306
+      trusty: ami-40870c21
+    ap-northeast-1:
+      precise: ami-411b2d26
+      xenial: ami-06d9a360
+      trusty: ami-8781fbe1
+    ap-southeast-1:
+      precise: ami-0050ea63
+      xenial: ami-c52b62b9
+      trusty: ami-a0f1bfdc
+    ap-southeast-2:
+      precise: ami-3e171c5d
+      xenial: ami-4ef83f2c
+      trusty: ami-a4e225c6
+    eu-central-1:
+      precise: ami-9814cbf7
+      xenial: ami-4d6c0e22
+      trusty: ami-b8187ad7
+    eu-west-1:
+      precise: ami-d80f02be
+      xenial: ami-cc166eb5
+      trusty: ami-39dca540
+    sa-east-1:
+      precise: ami-f7acc09b
+      xenial: ami-9188c0fd
+      trusty: ami-5071393c
+    us-east-1:
+      precise: ami-a04529b6
+      xenial: ami-ee4eac93
+      trusty: ami-9ac624e7
+    us-west-1:
+      precise: ami-aeb99ece
+      xenial: ami-9abbb3fa
+      trusty: ami-2faba34f
+    us-west-2:
+      precise: ami-270f9747
+      xenial: ami-0ee66876
+      trusty: ami-2133bc59
+    cn-north-1:
+      precise: ami-a23bedcf
+      trusty: ami-0b508d66
+      xenial: ami-cc4499a1
+    cn-northwest-1:
+      trusty: ami-41130723
+      xenial: ami-fd0e1a9f
+    ap-south-1:
+      xenial: ami-5383df3c
+    eu-west-2:
+      xenial: ami-30c22657
+    ca-central-1:
+      xenial: ami-11da5d75
+    ap-northeast-2:
+      xenial: ami-daaf02b4
+    us-east-2:
+      xenial: ami-b84c7bdd
+    eu-west-3:
+      xenial: ami-6775c31a
+
+Resources:
+  RedmineSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "RedmineSecurity-${AWS::StackName}"
+      GroupDescription: Allow access to redmine
+      SecurityGroupIngress:
+        - { CidrIp: 0.0.0.0/0, FromPort: -1, ToPort: -1, IpProtocol: icmp }
+        - { CidrIp: 0.0.0.0/0, FromPort: 22, ToPort: 22, IpProtocol: tcp }
+        - { CidrIp: 0.0.0.0/0, FromPort: 80, ToPort: 80, IpProtocol: tcp }
+        - { CidrIp: 0.0.0.0/0, FromPort: 443, ToPort: 443, IpProtocol: tcp }
+
+  Redmine:
+    Type: AWS::EC2::Instance
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          Install: [ setup, install ]
+        setup:
+          commands:
+            aptup:
+              command: apt update
+        install:
+          packages:
+            apt:
+              docker-compose: []
+              docker.io: []
+              postfix: []
+          files:
+            /etc/systemd/system/redmine.service:
+              content: |
+                [Unit]
+                Description=Redmine
+                [Service]
+                EnvironmentFile=-/etc/default/redmine-configuration
+                ExecStartPre=/bin/bash -c 'echo "SMTP_SERVER=$(curl http://169.254.169.254/latest/meta-data/local-ipv4)" > /etc/default/redmine-configuration'
+                ExecStartPre=/bin/bash -c 'curl -L https://github.com/guss77/redmine-compose/archive/master.tar.gz | tar -C /usr/share -zx --xform=s,redmine-compose-master,docker-redmine,'
+                ExecStartPre=/bin/bash -c '/usr/bin/perl -pi -e "s/example.com/$(cat /etc/default/redmine-domain)/" /usr/share/docker-redmine/configuration.yml'
+                ExecStart=/usr/bin/docker-compose -p redmine -f /usr/share/docker-redmine/docker-compose.yml up
+                ExecReload=/usr/bin/docker-compose -p redmine -f /usr/share/docker-redmine/docker-compose.yml pull
+                ExecReload=/usr/bin/docker-compose -p redmine -f /usr/share/docker-redmine/docker-compose.yml restart
+                ExecStop=/usr/bin/docker-compose -p redmine -f /usr/share/docker-redmine/docker-compose.yml down
+                Restart=on-failure
+                KillSignal=SIGINT
+                KillMode=process
+                [Install]
+                WantedBy=multi-user.target
+              mode: "000644"
+              owner: root
+              group: root
+            /etc/postfix/sasl_passwd:
+              content:
+                Fn::Sub: >
+                  [email-smtp.${AWS::Region}.amazonaws.com]:25 ${SESUsername}:${SESPassword}
+            /etc/default/redmine-domain:
+              content:
+                Ref: EmailDomain
+          commands:
+            reload:
+              command: /bin/systemctl daemon-reload
+            enable:
+              command: /bin/systemctl enable redmine.service
+            start:
+              command: /bin/systemctl start redmine.service
+            postfix:
+              command:
+                Fn::Sub: >
+                  postconf -e "mynetworks=127.0.0.0/8 [::ffff:127.0.0.0]/104 [::1]/128 172.16.0.0/12" \
+                            "relayhost=[email-smtp.${AWS::Region}.amazonaws.com]:25" \
+                            "smtp_sasl_auth_enable=yes" \
+                            "smtp_sasl_security_options=noanonymous" \
+                            "smtp_sasl_password_maps=hash:/etc/postfix/sasl_passwd" \
+                            "smtp_use_tls=yes" \
+                            "smtp_tls_security_level=encrypt" \
+                            "smtp_tls_note_starttls_offer=yes" \
+                            "smtp_tls_CAfile=/etc/ssl/certs/ca-certificates.crt"
+            postfix-ses-cred:
+              command: postmap hash:/etc/postfix/sasl_passwd
+
+    Properties:
+      ImageId: !FindInMap [ UbuntuAMIs, { Ref: "AWS::Region" }, xenial ]
+      InstanceType: !Ref InstanceType
+      SecurityGroups:
+       - Ref: RedmineSecurityGroup
+      KeyName: !Ref KeyName
+      UserData:
+        Fn::Base64:
+          Fn::Join:
+           - ""
+           - - "#!/bin/bash -xe\n"
+             - "apt install -y python-setuptools\n"
+             - "easy_install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz\n"
+             - "cfn-init -v --stack "
+             - Ref: AWS::StackName
+             - " --resource Redmine --configsets Install --region "
+             - Ref: AWS::Region
+             - "\n"
+
+  RedmineLoadBalancer:
+    Type: AWS::ElasticLoadBalancing::LoadBalancer
+    Condition: EnableELB
+    Properties:
+      HealthCheck:
+        Interval: 30
+        Timeout: 5
+        Target: HTTP:80/login
+        HealthyThreshold: 2
+        UnhealthyThreshold: 2
+      Instances:
+        - Ref: Redmine
+      LoadBalancerName: redmine
+      AvailabilityZones:
+        - Fn::GetAtt: [ Redmine, AvailabilityZone ]
+      Listeners:
+        - { InstancePort: 80, InstanceProtocol: http, LoadBalancerPort: 80, Protocol: http }
+      SecurityGroups:
+        - Fn::GetAtt: [ RedmineSecurityGroup, GroupId ]
+
+Outputs:
+  ServerAddress:
+    Description: The DNS address of the Redmine server
+    Value:
+      Fn::GetAtt: [ Redmine, PublicDnsName]
+    Export:
+      Name: !Sub "${AWS::StackName}-host"
+  LoadBalancerAddress:
+    Condition: EnableELB
+    Description: The DNS address of the Redmine load balancer
+    Value:
+      Fn::GetAtt: [ RedmineLoadBalancer, DNSName ]
+    Export:
+      Name: !Sub "${AWS::StackName}-loadbalancer"
